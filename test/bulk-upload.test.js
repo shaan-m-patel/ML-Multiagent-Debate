@@ -23,7 +23,12 @@ function csvWithQuestions(n) {
 }
 
 function dataRows(body) {
-  return body.trim().split(/\r?\n/).slice(1).filter(Boolean);
+  return body.trim().split(/\r?\n/).slice(1).filter(Boolean).map((row) => {
+    if (row.startsWith('"') && row.endsWith('"')) {
+      return row.slice(1, -1).replace(/""/g, '"');
+    }
+    return row;
+  });
 }
 
 function encodeMultipart(fields, file) {
@@ -181,6 +186,21 @@ describe('bulk upload limits', () => {
     const injected = await postBulk(port, { sample: '1; DROP TABLE questions', skip: '1' }, file);
     assert.equal(injected.status, 200, injected.body);
     assert.deepEqual(dataRows(injected.body), ['q1']);
+    await waitForNoUploads();
+  });
+
+  it('rejects a missing file and a csv without a question column', async () => {
+    const missing = await postBulk(port, { sample: '10', skip: '1' });
+    assert.equal(missing.status, 400);
+    assert.match(missing.body, /No file uploaded/);
+
+    const rejected = await postBulk(
+      port,
+      { sample: '10', skip: '1' },
+      { filename: 'notes.csv', content: Buffer.from('title\nhello\n') }
+    );
+    assert.equal(rejected.status, 400);
+    assert.match(rejected.body, /question/);
     await waitForNoUploads();
   });
 

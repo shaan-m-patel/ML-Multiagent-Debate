@@ -559,7 +559,9 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+  // Busboy reports the limit once the file reaches this size, so the ceiling
+  // is one byte above the 5 MB maximum we accept.
+  limits: { fileSize: MAX_UPLOAD_BYTES + 1, files: 1 },
   fileFilter: datasetFileFilter
 });
 
