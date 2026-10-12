@@ -398,8 +398,8 @@ app.get('/bulk', (_, res) => res.send(`
       <a href="/">Home</a> | <a href="/legal">Legal</a> | <a href="/math">Math</a> | <a href="/bulk">Bulk</a>
     </nav>
     <h1 class="mt-4">Bulk Debate Dataset</h1>
-    <p>Upload a <code>.parquet</code> or <code>.csv</code> file that contains a column named <code>question</code>.  
-       The server will run one debate per question and return a CSV with the answers.</p>
+    <p>Upload a <code>.parquet</code> or <code>.csv</code> file (${MAX_UPLOAD_BYTES / (1024 * 1024)}&nbsp;MB max) that contains a column named <code>question</code>.
+       At most ${MAX_SAMPLE_ROWS} questions are sampled. The server runs one debate per sampled question and returns a CSV with the answers.</p>
 
     <form id="uploadForm" enctype="multipart/form-data">
       <div class="form-group">
@@ -408,7 +408,7 @@ app.get('/bulk', (_, res) => res.send(`
     <div class="form-group">
     <label for="sampleInput">Sample size (rows):</label>
     <input type="number" id="sampleInput" class="form-control"
-           value="5000" min="1">
+           value="${MAX_SAMPLE_ROWS}" min="1" max="${MAX_SAMPLE_ROWS}">
   </div>
   <div class="form-check mb-3">
     <input class="form-check-input" type="checkbox" id="skipInference">
@@ -435,17 +435,24 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     status.textContent = 'Choose a file first';
     return;
   }
+  if (file.size > ${MAX_UPLOAD_BYTES}) {
+    status.textContent = 'File exceeds the ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB upload limit.';
+    return;
+  }
 
   status.textContent = 'Uploading & processing – please wait…';
 
   const fd = new FormData();
   fd.append('file', file);
-  fd.append('sample', sample);   // e.g. "5000"
+  fd.append('sample', sample);   // 1..${MAX_SAMPLE_ROWS}
   fd.append('skip',   skip);     // "1" or "0"
 
   try {
     const r = await fetch('/api/bulk/debate', { method: 'POST', body: fd });
-    if (!r.ok) throw new Error('Server ' + r.status);
+    if (!r.ok) {
+      const msg = (await r.text()).trim();
+      throw new Error(msg || ('Server ' + r.status));
+    }
 
     const blob = await r.blob();
     const url  = URL.createObjectURL(blob);
@@ -520,6 +527,23 @@ app.post('/api/math/debate', async (req, res) => {
 ------------------------------------------------------------------ */
 const crypto = require('crypto');
 
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const MAX_SAMPLE_ROWS = 100;
+const ALLOWED_UPLOAD_EXTS = new Set(['.csv', '.parquet']);
+
+function clampSampleSize(raw) {
+  return Math.min(
+    Math.max(parseInt(raw || String(MAX_SAMPLE_ROWS), 10) || MAX_SAMPLE_ROWS, 1),
+    MAX_SAMPLE_ROWS
+  );
+}
+
+function datasetFileFilter(req, file, cb) {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  if (ALLOWED_UPLOAD_EXTS.has(ext)) return cb(null, true);
+  cb(new Error('Only .csv and .parquet files are allowed.'));
+}
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = path.join(__dirname, 'uploads');
@@ -527,21 +551,47 @@ const storage = multer.diskStorage({
     cb(null, dir);
   },
   filename: (req, file, cb) => {
-    const origExt = path.extname(file.originalname).toLowerCase(); // ".parquet" or ".csv"
-    const ext     = origExt || '';                                  // keep whatever it was
-    cb(null, `${crypto.randomUUID()}${ext}`);
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const safeExt = ALLOWED_UPLOAD_EXTS.has(ext) ? ext : '';
+    cb(null, `${crypto.randomUUID()}${safeExt}`);
   }
 });
 
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  // Busboy reports the limit once the file reaches this size, so the ceiling
+  // is one byte above the 5 MB maximum we accept.
+  limits: { fileSize: MAX_UPLOAD_BYTES + 1, files: 1 },
+  fileFilter: datasetFileFilter
+});
+
+function rejectUpload(err, res) {
+  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).send('File exceeds the 5 MB upload limit.');
+  }
+  const message = err instanceof multer.MulterError
+    ? 'Upload rejected.'
+    : (err.message || 'Upload rejected.');
+  return res.status(400).send(message);
+}
 
 /* ------------------------------------------------------------------
    BULK DATASET ENDPOINT  –  accepts .parquet or .csv
 ------------------------------------------------------------------ */
-app.post('/api/bulk/debate', upload.single('file'), async (req, res) => {
+app.post('/api/bulk/debate', (req, res) => {
+  upload.single('file')(req, res, (uploadErr) => {
+    if (uploadErr) return rejectUpload(uploadErr, res);
+    handleBulkDebate(req, res).catch((error) => {
+      console.error('Bulk debate error:', error);
+      if (!res.headersSent) res.status(500).send('Error processing upload.');
+    });
+  });
+});
+
+async function handleBulkDebate(req, res) {
   if (!req.file) return res.status(400).send('No file uploaded');
 
-  const SAMPLE_N   = parseInt(req.body.sample || '5000', 10);
+  const SAMPLE_N   = clampSampleSize(req.body.sample);
   const SKIP_MODEL = req.body.skip === '1';
   const questions  = [];
 
@@ -549,82 +599,100 @@ app.post('/api/bulk/debate', upload.single('file'), async (req, res) => {
   const escaped    = fullPath.replace(/\\/g, '\\\\')     // Windows safety (harmless on Linux)
                               .replace(/'/g,  "''");     // quote escaping
 
-  /* ---------- 1.  Try Parquet first if extension is .parquet ---------- */
-  let parquetOK = false;
-  if (path.extname(fullPath).toLowerCase() === '.parquet') {
-    try {
+  try {
+    /* ---------- 1.  Try Parquet first if extension is .parquet ---------- */
+    let parquetOK = false;
+    if (path.extname(fullPath).toLowerCase() === '.parquet') {
       const db  = new duckdb.Database(':memory:');
       const con = db.connect();
-
-      await con.each(
-        `SELECT question
-           FROM read_parquet('${escaped}')
-          WHERE question IS NOT NULL
-          ORDER BY random()
-          LIMIT ${SAMPLE_N}`,
-        [],
-        (err, row) => { if (err) throw err; questions.push(row.question); }
-      );
-
-      await con.close(); db.close();
-      parquetOK = true;
-    } catch (e) {
-      console.error('Parquet read failed, will try CSV fallback:', e.message);
+      try {
+        const rows = await new Promise((resolve, reject) => {
+          con.all(
+            `SELECT question
+               FROM read_parquet('${escaped}')
+              WHERE question IS NOT NULL
+              ORDER BY random()
+              LIMIT ${SAMPLE_N}`,
+            (err, result) => (err ? reject(err) : resolve(result || []))
+          );
+        });
+        for (const row of rows) {
+          if (row && row.question && questions.length < SAMPLE_N) questions.push(row.question);
+        }
+        parquetOK = true;
+      } catch (e) {
+        console.error('Parquet read failed, will try CSV fallback:', e.message);
+      } finally {
+        await new Promise((resolve) => con.close(() => resolve()));
+        db.close();
+      }
     }
-  }
 
-  /* ---------- 2.  CSV fallback ---------- */
-  if (!parquetOK) {
-    try {
-      await new Promise((ok, bad) => {
-        fs.createReadStream(fullPath)
-          .pipe(csvParser())
-          .on('data', r => { if (r.question) questions.push(r.question); })
-          .on('end', ok)
-          .on('error', bad);
-      });
-    } catch (csvErr) {
-      console.error('CSV fallback failed', csvErr);
-      fs.unlink(fullPath, () => {});
-      return res.status(400)
-        .send('File must be a valid Parquet or CSV with a "question" column');
+    /* ---------- 2.  CSV fallback ---------- */
+    if (!parquetOK) {
+      try {
+        await new Promise((ok, bad) => {
+          fs.createReadStream(fullPath)
+            .pipe(csvParser())
+            .on('data', r => {
+              if (questions.length >= SAMPLE_N) return;
+              if (r.question) questions.push(r.question);
+            })
+            .on('end', ok)
+            .on('error', bad);
+        });
+      } catch (csvErr) {
+        console.error('CSV fallback failed', csvErr);
+        return res.status(400)
+          .send('File must be a valid Parquet or CSV with a "question" column');
+      }
     }
-  }
 
-  if (!questions.length) {
-    fs.unlink(fullPath, () => {});
-    return res.status(400).send('No "question" column found.');
-  }
+    // Apply the same row cap on every path. Parquet also uses LIMIT above.
+    questions.splice(SAMPLE_N);
 
-  /* ---------- 3.  If skip=1, return sampled CSV only ---------- */
-  if (SKIP_MODEL) {
-    const csv = new Parser({ fields: ['question'] })
-      .parse(questions.map(q => ({ question: q })));
+    if (!questions.length) {
+      return res.status(400).send('No "question" column found.');
+    }
+
+    /* ---------- 3.  If skip=1, return sampled CSV only ---------- */
+    if (SKIP_MODEL) {
+      const csv = new Parser({ fields: ['question'] })
+        .parse(questions.map(q => ({ question: q })));
+      res.set('Content-Type',        'text/csv')
+         .set('Content-Disposition', 'attachment; filename="sampled_questions.csv"')
+         .send(csv);
+      return;
+    }
+
+    /* ---------- 4.  Otherwise run debates ---------- */
+    const results = [];
+    for (const q of questions) {
+      const { finalAnswer } = await multiagentDebate(q, 1); // 1-round debate
+      results.push({ question: q, debate_answer: finalAnswer });
+    }
+
+    /* ---------- 5.  Return CSV with answers ---------- */
+    const csv = new Parser({ fields: ['question', 'debate_answer'] }).parse(results);
     res.set('Content-Type',        'text/csv')
-       .set('Content-Disposition', 'attachment; filename="sampled_questions.csv"')
+       .set('Content-Disposition', 'attachment; filename="debate_results.csv"')
        .send(csv);
-    fs.unlink(fullPath, () => {});
-    return;
+  } finally {
+    fs.unlink(fullPath, () => {});                // clean temp file
   }
-
-  /* ---------- 4.  Otherwise run debates ---------- */
-  const results = [];
-  for (const q of questions) {
-    const { finalAnswer } = await multiagentDebate(q, 1); // 1-round debate
-    results.push({ question: q, debate_answer: finalAnswer });
-  }
-
-  /* ---------- 5.  Return CSV with answers ---------- */
-  const csv = new Parser({ fields: ['question', 'debate_answer'] }).parse(results);
-  res.set('Content-Type',        'text/csv')
-     .set('Content-Disposition', 'attachment; filename="debate_results.csv"')
-     .send(csv);
-
-  fs.unlink(fullPath, () => {});                // clean temp file
-});
+}
 /* ========== Start Server ========== */
 
 
-app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
-});
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`Server is running on http://localhost:${port}`);
+  });
+}
+
+module.exports = {
+  app,
+  clampSampleSize,
+  MAX_UPLOAD_BYTES,
+  MAX_SAMPLE_ROWS
+};
